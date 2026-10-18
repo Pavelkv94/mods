@@ -1,0 +1,6 @@
+{
+  "name": "smart-compact",
+  "version": "0.1.0",
+  "description": "Context fill and rate limits above the prompt, plus a Smart compact button that writes a handoff doc, compacts and re-reads it",
+  "types": "./types/index.d.ts"
+}

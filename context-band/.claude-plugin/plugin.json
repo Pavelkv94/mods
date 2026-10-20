@@ -1,0 +1,6 @@
+{
+  "name": "context-band",
+  "version": "0.9.1",
+  "description": "Band above the prompt: context fill, rate limits, session cost and a Handoff button that writes a handoff doc, clears the context and reads it back",
+  "types": "./types/index.d.ts"
+}

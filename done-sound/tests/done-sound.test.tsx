@@ -4,8 +4,9 @@ const TURN = { answer: 'ok', durationMs: 10, isAborted: false, turnId: 't1', rea
 
 async function played($: any, on: any, turn: object): Promise<string[]> {
   const clips: string[] = []
-  on('audio.play', (_$: unknown, e: { clip: { asset?: string } }) => {
-    clips.push(e.clip.asset ?? '')
+  on('fs.read', (_$: unknown, e: { path: string }) => ({ value: { base64: btoa(e.path) } }))
+  on('audio.play', (_$: unknown, e: { clip: { base64?: string; mime?: string } }) => {
+    clips.push(`${e.clip.mime} ${atob(e.clip.base64 ?? '')}`)
     return { value: undefined }
   })
   on('turn.complete', () => ({ text: 'ok' }))
@@ -15,8 +16,8 @@ async function played($: any, on: any, turn: object): Promise<string[]> {
   return clips
 }
 
-test('main-loop answer plays Glass', async ($, on) => {
-  expect(await played($, on, TURN)).toEqual(['sounds/glass.aiff'])
+test('main-loop answer plays the system Glass sound', async ($, on) => {
+  expect(await played($, on, TURN)).toEqual(['audio/aiff /System/Library/Sounds/Glass.aiff'])
 })
 
 test('subagent turn plays nothing', async ($, on) => {

@@ -1,7 +1,7 @@
 {
   "name": "agent-crabs",
-  "version": "0.2.3",
-  "description": "Side pane with a card per subagent: animated crab, model, progress bar, API-equivalent cost, and expandable details of its operations, files and tokens",
+  "version": "0.4.0",
+  "description": "Side pane with a card per subagent and background process: animated crab, model, context fill, idle warning, API-equivalent cost, and expandable operations, files and tokens",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Pavel Kazlou"

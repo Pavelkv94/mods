@@ -63,9 +63,9 @@ test('an opened card lists its operations, files, todos and what each token side
 
   for (const surface of ['desktop', 'terminal'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    // closed: the todo list drives the bar, the cost shows, the details do not
+    // closed: the todo list names the progress, the bar shows the context, the cost shows, the details do not
     expect(await ui.find({ type: 'Text', text: /1\/4 todos · Editing the client/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /25%/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /ctx 101k\/1M · 10%/ })).toBeDefined()
     // 1k in × $4 + 1k out × $20 + 100k cache read × $0.20, per million
     expect(await ui.find({ type: 'Text', text: /\$0\.044/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /OPERATIONS/ })).toBeUndefined()

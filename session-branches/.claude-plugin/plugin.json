@@ -1,0 +1,6 @@
+{
+  "name": "session-branches",
+  "version": "0.1.0",
+  "description": "Terminal-only pane with the tree of this project's sessions and their forks; press a row to switch to it",
+  "types": "./types/index.d.ts"
+}

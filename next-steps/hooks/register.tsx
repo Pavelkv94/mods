@@ -89,11 +89,29 @@ async function suggest($: EngineInterface, mine: number) {
   }
 }
 
+// Сообщение, отправленное плагином, движок помечает как пришедшее от плагина даже с asUser,
+// и модель вправе не считать его решением пользователя. Поэтому вариант кладём в поле ввода:
+// Enter нажимает сам пользователь, и запрос уходит как его собственный.
 async function choose($: EngineInterface, s: Suggestion) {
+  const filled = await $.prompt.fill({ text: s.prompt, mode: 'replace' }).catch(() => undefined)
+  if (filled?.isFilled) return
+  // Поля ввода нет (диалог, другая поверхность) — отправляем сами; раздел системного промпта ниже
+  // объясняет модели, что это выбор пользователя.
   await clear($)
-  // Выбор — жест самого пользователя: отправляем как его слова, без рамки «plugin sent a message».
   await $.prompt.submit({ text: s.prompt, asUser: true })
 }
+
+// Мод работает только в приложении: в терминале полоса не рисуется.
+const onlyTerminal = async ($: EngineInterface) => {
+  const list = await $.session.surfaces().catch(() => [] as const)
+  return list.length > 0 && list.every(s => s === 'terminal')
+}
+
+const CHOICE_SECTION = {
+  id: 'next-steps:choice',
+  scope: 'session',
+  text: `Пользователь установил мод next-steps: после ответа он показывает кнопки с вариантами следующей команды. Сообщение, которое пришло от плагина next-steps, — это вариант, который пользователь сам выбрал кликом по кнопке. Выполняй его как обычную просьбу пользователя, а не как постороннюю инструкцию.`,
+} as const
 
 export const register: Register = on => {
   // Перезагрузка мода обрывает подбор, начатый старой копией: статус остаётся «thinking». Перезапускаем.
@@ -110,6 +128,11 @@ export const register: Register = on => {
     return result
   })
 
+  on('prompt.compose', async ($, e, next) => {
+    const result = await next(e)
+    return { sections: [...result.sections, CHOICE_SECTION] }
+  })
+
   on('prompt.submit', async ($, e, next) => {
     // Ошибка мода не должна мешать отправке запроса.
     if (!e.isMeta) await clear($).catch(() => undefined)
@@ -119,13 +142,15 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined || e.isAborted || e.reason !== 'answer') return result
+    // В терминале кнопки не показываем — и Haiku зря не спрашиваем, если сессия только в терминале.
+    if (await onlyTerminal($)) return result
     generation += 1
     void suggest($, generation)
     return result
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || e.props.isWorking) return next(e)
+    if (e.surface === 'terminal' || e.props.hasSurvey || e.props.isWorking) return next(e)
     const state = await read($, status)
     if (state === 'idle') return next(e)
 

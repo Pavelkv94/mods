@@ -7,7 +7,7 @@
     {
       "name": "agent-crabs",
       "source": "./agent-crabs",
-      "description": "Side pane with a card per subagent: animated crab, model, progress bar, API-equivalent cost, and expandable details of its operations, files and tokens"
+      "description": "Side pane with a card per subagent and background process: animated crab, model, context fill, idle warning, API-equivalent cost, and expandable operations, files and tokens"
     },
     {
       "name": "context-band",
@@ -17,7 +17,17 @@
     {
       "name": "next-steps",
       "source": "./next-steps",
-      "description": "После каждого ответа Haiku предлагает над полем ввода три разных варианта следующей команды столбиком с полным текстом; клик или цифра 1–3 отправляет её в чат."
+      "description": "Только в desktop-приложении: после каждого ответа Haiku предлагает над полем ввода три разных варианта следующей команды столбиком с полным текстом; клик или цифра 1–3 вставляет её в поле ввода, Enter отправляет как твою команду."
+    },
+    {
+      "name": "done-sound",
+      "source": "./done-sound",
+      "description": "Проигрывает звук Glass, когда Claude завершает задачу ответом (только основной цикл, без сабагентов)."
+    },
+    {
+      "name": "session-branches",
+      "source": "./session-branches",
+      "description": "Terminal-only pane with the tree of this project's sessions and their forks; press a row to switch to it"
     }
   ]
 }

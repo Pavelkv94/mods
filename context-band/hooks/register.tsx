@@ -1,15 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Activity, Cache, Flow, Usage } from '../types'
+import type { Activity, Cache, CacheConfig, Flow, Usage } from '../types'
 import {
   adviceColor,
   advise,
   BIG_CONTEXT,
   barSvg,
   cacheColor,
+  cacheConfig,
+  DEFAULT_CACHE_CONFIG,
   cachePercent,
   pieSvg,
+  ringSvg,
   cacheLeftMs,
   cacheText,
   cacheTtlMs,
@@ -17,12 +20,15 @@ import {
   cacheWarnMs,
   degradation,
   HANDOFF_LABEL,
+  idleLeftMs,
   handoffPath,
   levelColor,
   limitName,
   meter,
   MIN_HANDOFF_BYTES,
+  MTIME_SLACK_MS,
   NO_ACTIVITY,
+  parseModel,
   recordTool,
   PALETTE,
   pickFit,
@@ -36,7 +42,7 @@ import {
 } from './lib'
 
 const usageAtom = atom({ plugin: 'context-band', key: 'usage' } as const, null)
-const IDLE: Flow = { phase: 'idle', path: null }
+const IDLE: Flow = { phase: 'idle', path: null, startedAt: null }
 const flowAtom = atom({ plugin: 'context-band', key: 'flow' } as const, IDLE)
 const NO_CACHE: Cache = { lastAt: null, warned: false }
 const cacheAtom = atom({ plugin: 'context-band', key: 'cache' } as const, NO_CACHE)
@@ -44,6 +50,39 @@ const cacheAtom = atom({ plugin: 'context-band', key: 'cache' } as const, NO_CAC
 const tickAtom = atom({ plugin: 'context-band', key: 'tick' } as const, 0)
 const handoffAtom = atom({ plugin: 'context-band', key: 'handoff' } as const, null)
 const activityAtom = atom({ plugin: 'context-band', key: 'activity' } as const, NO_ACTIVITY)
+const configAtom = atom({ plugin: 'context-band', key: 'config' } as const, DEFAULT_CACHE_CONFIG)
+
+// idle compaction runs only in an interactive terminal; the timer has no surface of its own, so it reads the last drawn
+let lastSurface: string | null = null
+
+async function readJson($: EngineInterface, path: string): Promise<Record<string, unknown>> {
+  try {
+    const value: unknown = JSON.parse(String(await $.fs.read(path)))
+    return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Reads the env and the user, project and local settings, later ones winning, as Claude Code layers them. */
+async function loadConfig($: EngineInterface): Promise<void> {
+  // each name literal: the engine lists the variables a module reads
+  const env: Record<string, string | undefined> = {
+    FORCE_PROMPT_CACHING_5M: await $.env.get('FORCE_PROMPT_CACHING_5M'),
+    CLAUDE_CODE_PROMPT_CACHE_TTL: await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'),
+    ENABLE_PROMPT_CACHING_1H: await $.env.get('ENABLE_PROMPT_CACHING_1H'),
+    DISABLE_AUTO_COMPACT: await $.env.get('DISABLE_AUTO_COMPACT'),
+    CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS'),
+  }
+  const home = (await $.env.get('HOME')) ?? '~'
+  const root = await $.session.root()
+  const settings = {
+    ...(await readJson($, `${home}/.claude/settings.json`)),
+    ...(await readJson($, `${root}/.claude/settings.json`)),
+    ...(await readJson($, `${root}/.claude/settings.local.json`)),
+  }
+  await update($, configAtom, (): CacheConfig => cacheConfig(env, settings))
+}
 
 const PHASE_TEXT: Record<Flow['phase'], string> = {
   idle: '',
@@ -54,12 +93,16 @@ const PHASE_TEXT: Record<Flow['phase'], string> = {
 
 async function refresh($: EngineInterface): Promise<void> {
   const u = await $.session.usage()
+  // /model may show a bare alias; the id the last response reported names the version
+  const named = await $.session.model().catch(() => null)
+  const known = (await read($, usageAtom))?.model ?? null
   const next: Usage = {
     percent: u.context.percent ?? null,
     tokens: u.context.tokens ?? null,
     window: u.context.window,
     limits: u.rateLimits.map(l => ({ kind: l.kind, percentUsed: l.percentUsed, resetsAt: l.resetsAt })),
     cost: u.cost?.usd ?? null,
+    model: parseModel(named) ? named : (known ?? named),
   }
   await update($, usageAtom, () => next)
 }
@@ -71,9 +114,14 @@ async function tickCache($: EngineInterface): Promise<void> {
   const cache = await read($, cacheAtom)
   if (cache.lastAt === null || cache.warned) return
   const usage = await read($, usageAtom)
-  const ttl = cacheTtlMs((usage?.limits.length ?? 0) > 0)
+  const config = await read($, configAtom)
+  const ttl = cacheTtlMs(usage?.limits ?? [], config.ttl)
   const left = cacheLeftMs(cache.lastAt, ttl, now)
-  if (left !== null && left > 0 && left <= cacheWarnMs(ttl)) {
+  const idle = idleLeftMs({ lastAt: cache.lastAt, ttl, tokens: usage?.tokens ?? null, config, terminal: lastSurface === 'terminal', now })
+  if (idle !== null && idle > 0 && idle <= cacheWarnMs(ttl)) {
+    await update($, cacheAtom, (c): Cache => ({ ...c, warned: true }))
+    $.ui.toast(`Claude Code compacts this idle conversation in ${Math.ceil(idle / 60_000)} min: send a message to keep it, or Handoff now`)
+  } else if (left !== null && left > 0 && left <= cacheWarnMs(ttl)) {
     await update($, cacheAtom, (c): Cache => ({ ...c, warned: true }))
     const min = Math.ceil(left / 60_000)
     $.ui.toast(
@@ -89,30 +137,34 @@ async function start($: EngineInterface): Promise<string> {
   if (flow.phase !== 'idle') return 'Handoff is already running.'
   const home = (await $.env.get('HOME')) ?? '~'
   const root = await $.session.root()
-  const path = handoffPath(home, root, await $.clock.now())
-  await update($, flowAtom, (): Flow => ({ phase: 'writing', path }))
+  const now = await $.clock.now()
+  const path = handoffPath(home, root, now)
+  await update($, flowAtom, (): Flow => ({ phase: 'writing', path, startedAt: now }))
   const sent = await $.prompt.submit({ text: writePrompt(path, root, await read($, handoffAtom)) })
   if ('drop' in sent && sent.drop !== undefined) {
-    await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+    await update($, flowAtom, () => IDLE)
     $.ui.toast(`Handoff cancelled: ${sent.drop}`)
   }
   return `Handoff → ${path}, then /clear`
 }
 
-/** Whether the model really wrote a handoff worth clearing the context for; each run's path is new. */
-async function handoffWritten($: EngineInterface, path: string): Promise<boolean> {
+/**
+ * Whether the model really wrote a handoff worth clearing the context for: written during this run,
+ * so an earlier file at the same path never stands in for one the model did not write.
+ */
+async function handoffWritten($: EngineInterface, path: string, since: number): Promise<boolean> {
   const stat = await $.fs.stat(path).catch(() => undefined)
-  return stat !== undefined && stat.kind === 'file' && stat.size >= MIN_HANDOFF_BYTES
+  return stat !== undefined && stat.kind === 'file' && stat.size >= MIN_HANDOFF_BYTES && stat.mtimeMs >= since - MTIME_SLACK_MS
 }
 
 /** Clears the conversation, then has the fresh one read the handoff. */
 async function clearAndRead($: EngineInterface, path: string): Promise<void> {
-  await update($, flowAtom, (): Flow => ({ phase: 'clearing', path }))
+  await update($, flowAtom, (): Flow => ({ phase: 'clearing', path, startedAt: null }))
   try {
     // $.command.run is queued and runs once the session is idle, as if the person typed /clear
     await $.command.run({ command: 'clear', args: '' })
   } catch (err) {
-    await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+    await update($, flowAtom, () => IDLE)
     $.ui.toast(`/clear failed: ${String(err)}. The handoff is saved: ${path}`)
     return
   }
@@ -120,11 +172,11 @@ async function clearAndRead($: EngineInterface, path: string): Promise<void> {
   await update($, cacheAtom, () => NO_CACHE)
   await update($, activityAtom, () => NO_ACTIVITY)
   await update($, handoffAtom, () => path)
-  await update($, flowAtom, (): Flow => ({ phase: 'reading', path }))
+  await update($, flowAtom, (): Flow => ({ phase: 'reading', path, startedAt: null }))
   void refresh($)
   const sent = await $.prompt.submit({ text: readPrompt(path) })
   if ('drop' in sent && sent.drop !== undefined) {
-    await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+    await update($, flowAtom, () => IDLE)
     $.ui.toast(`Context cleared, but the read prompt was dropped (${sent.drop}). Ask to read ${path}`)
   }
 }
@@ -133,7 +185,7 @@ async function clearAndRead($: EngineInterface, path: string): Promise<void> {
 async function alertStrain($: EngineInterface): Promise<void> {
   const usage = await read($, usageAtom)
   const activity = await read($, activityAtom)
-  const tip = degradation(usage?.tokens ?? 0, activity)
+  const tip = degradation(usage?.tokens ?? 0, activity, usage?.model ?? null)
   if (!tip || tip.tone === 'info' || toneRank(tip.tone) <= toneRank(activity.alerted)) return
   await update($, activityAtom, (a): Activity => ({ ...a, alerted: tip.tone }))
   $.ui.toast(tip.text)
@@ -148,7 +200,9 @@ async function warm($: EngineInterface): Promise<void> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     $.clock.every(30_000, () => void tickCache($))
-    await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+    await update($, flowAtom, () => IDLE)
+    // unread settings leave Claude Code's defaults, which is what most sessions run on
+    void loadConfig($).catch(() => undefined)
     await $.command.register({
       name: 'handoff',
       description: 'Write a handoff doc, /clear the session, then read the handoff in the fresh context',
@@ -174,6 +228,18 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // a compaction the person or the engine ran (/compact, the auto threshold): the work the counts
+  // describe is summarized away, and the new transcript has no prompt cache of its own yet
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined) {
+      await update($, activityAtom, () => NO_ACTIVITY)
+      await update($, cacheAtom, () => NO_CACHE)
+      void refresh($)
+    }
+    return result
+  })
+
   // subagents' calls fill their own context, not this one
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
@@ -195,6 +261,9 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined) return result
+    // the id the response reported, written before the refresh that reads it back
+    const model = e.usage?.model
+    if (model !== undefined && parseModel(model)) await update($, usageAtom, u => (u ? { ...u, model } : u))
     void refresh($).then(() => alertStrain($))
     // the turn's last API response just refreshed the prompt cache
     if (e.usage !== undefined) {
@@ -206,19 +275,19 @@ export const register: Register = on => {
     if (flow.phase === 'writing' && flow.path) {
       const path = flow.path
       if (e.isAborted || e.reason !== 'answer') {
-        await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+        await update($, flowAtom, () => IDLE)
         $.ui.toast('Handoff interrupted: nothing was cleared')
         return result
       }
       // /clear loses everything not in the file, so clear only over a real handoff
-      if (!(await handoffWritten($, path))) {
-        await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+      if (!(await handoffWritten($, path, flow.startedAt ?? 0))) {
+        await update($, flowAtom, () => IDLE)
         $.ui.toast(`Handoff not found or too short at ${path}: the context was NOT cleared`)
         return result
       }
       void clearAndRead($, path)
     } else if (flow.phase === 'reading') {
-      await update($, flowAtom, (): Flow => ({ phase: 'idle', path: null }))
+      await update($, flowAtom, () => IDLE)
       void refresh($)
     }
     return result
@@ -233,7 +302,9 @@ export const register: Register = on => {
     const now = Math.max(await $.clock.now(), await read($, tickAtom))
     const cache = await read($, cacheAtom)
     const working = e.props.isWorking
-    const ttl = cacheTtlMs((usage?.limits.length ?? 0) > 0)
+    lastSurface = e.surface
+    const config = await read($, configAtom)
+    const ttl = cacheTtlMs(usage?.limits ?? [], config.ttl)
     const cacheLeft = cacheLeftMs(cache.lastAt, ttl, now)
     const cacheTone = cacheColor(cacheLeft, ttl, working)
     const cacheValue = cacheText(cacheLeft, working)
@@ -243,7 +314,8 @@ export const register: Register = on => {
     // warming a cold cache is no ping but a full re-write, so the button goes inert then
     const warmable = working || (cacheLeft !== null && cacheLeft > 0)
     const activity = await read($, activityAtom)
-    const tip = usage && idle && !working ? advise({ ...usage, cacheLeft, ttl, now, activity }) : null
+    const idleLeft = idleLeftMs({ lastAt: cache.lastAt, ttl, tokens: usage?.tokens ?? null, config, terminal: e.surface === 'terminal', now })
+    const tip = usage && idle && !working ? advise({ ...usage, cacheLeft, ttl, now, activity, idleLeft }) : null
     const limits = usage?.limits ?? []
     const cost = usage?.cost ?? null
 
@@ -255,6 +327,8 @@ export const register: Register = on => {
           {label !== '' && <Text size="caption" color={PALETTE.muted} wrap="truncate-end">{label}</Text>}
           {chart === 'pie' ? (
             <Svg source={pieSvg(percent, tone)} alt={alt} width={14} height={14} />
+          ) : chart === 'ring' ? (
+            <Svg source={ringSvg(percent, tone)} alt={alt} width={14} height={14} />
           ) : chart === 'bar' ? (
             <Svg source={barSvg(percent, tone, 40, 5)} alt={alt} width={40} height={5} />
           ) : null}
@@ -270,23 +344,27 @@ export const register: Register = on => {
         <Box flexDirection="column" gap="xs">
           {below}
           {tip && <Text size="caption" color={adviceColor(tip.tone)}>{tip.text}</Text>}
-          <Box flexDirection="row" alignItems="center" flexWrap="nowrap" columnGap="md" overflow="hidden">
-            {segment(
-              'context', 'Context', pct ?? 0, ctxTone, pct === null ? '—' : `${pct}%`,
-              usage ? tokensText(usage, true) : '',
-              `Context ${pct ?? '—'}% full`,
-            )}
-            {limits.map(l => {
-              const reset = resetIn(l.resetsAt, now)
-              return segment(
-                l.kind, limitName(l.kind), l.percentUsed, levelColor(l.percentUsed),
-                `${Math.round(l.percentUsed)}%`, reset,
-                `${limitName(l.kind)} limit ${Math.round(l.percentUsed)}% used`,
-              )
-            })}
-            {cost !== null && segment('cost', '', 0, PALETTE.accent, costText(cost), '', `Session cost ${costText(cost)}`, 'none')}
+          {/* context and limits hold the left edge, the rest the right one, so a changing value never shifts the other side */}
+          <Box flexDirection="row" alignItems="center" justifyContent="space-between" flexWrap="nowrap" columnGap="md" overflow="hidden">
+            <Box key="meters" flexDirection="row" alignItems="center" flexWrap="nowrap" columnGap="md" flexShrink={1} minWidth={0} overflow="hidden">
+              {segment(
+                'context', 'Context', pct ?? 0, ctxTone, pct === null ? '—' : `${pct}%`,
+                usage ? tokensText(usage, true) : '',
+                `Context ${pct ?? '—'}% full`,
+              )}
+              {limits.map(l => {
+                const reset = resetIn(l.resetsAt, now)
+                return segment(
+                  l.kind, limitName(l.kind), l.percentUsed, levelColor(l.percentUsed),
+                  `${Math.round(l.percentUsed)}%`, reset,
+                  `${limitName(l.kind)} limit ${Math.round(l.percentUsed)}% used`,
+                  'ring',
+                )
+              })}
+            </Box>
             {/* the button sits right after the cache and never shrinks away */}
             <Box key="tail" flexDirection="row" alignItems="center" gap="md" flexWrap="nowrap" flexShrink={0}>
+              {cost !== null && segment('cost', '', 0, PALETTE.accent, costText(cost), '', `Session cost ${costText(cost)}`, 'none')}
               {segment(
                 'cache', 'Cache', cachePercent(cacheLeft, ttl, working), cacheTone, cacheValue,
                 '',

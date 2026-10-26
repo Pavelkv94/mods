@@ -23,8 +23,21 @@ export type FileTouch = { path: string; ops: FileOp[]; added: number; removed: n
 // the subagent's own todo list, when it keeps one
 export type Plan = { done: number; total: number; current?: string }
 
-export type AgentCard = {
+// What the responses cost so far at list price, in US dollars. A cache write is kept at the
+// base input price until its lifetime is known: 1.25× for five minutes, 2× for an hour.
+export type Spend = {
+  costIn: number
+  costOut: number
+  costCacheRead: number
+  cacheWriteBase: number
+  // a response came from a model the price table lacks
+  unpriced?: boolean
+}
+
+export type AgentCard = Spend & {
   id: string
+  // the subagent that spawned it; absent when the main loop did
+  parentId?: string
   role: string
   description: string
   model: string
@@ -48,6 +61,11 @@ export type AgentCard = {
   lastText?: string
   result?: string
   crab: number
+  // last time a step or tool call of its own began or ended
+  lastEventAt?: number
+  // from the Agent tool's record once it returns: the share of cache writes kept an hour, and fast mode
+  cacheWrite1hShare?: number
+  fast?: boolean
 }
 
 export type ProcessKind = 'shell' | 'monitor'
@@ -56,6 +74,7 @@ export type BgProcess = {
   id: string
   kind: ProcessKind
   description: string
+  // its first line, as the card shows it
   command: string
   owner?: string
   startedAt: number
@@ -76,10 +95,14 @@ declare module 'claude-code' {
     'agent-crabs': {
       agents: AgentCard[]
       processes: BgProcess[]
+      // the session's context window as the engine last measured it; 0 before the first measure
+      window: number
       now: number
       closedByHand: boolean
       // ids of the cards opened to their details
       expanded: string[]
+      // the process whose Stop was pressed once and waits for the second press; '' for none
+      confirmStop: string
     }
   }
 }

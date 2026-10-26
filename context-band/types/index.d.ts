@@ -7,13 +7,19 @@ export type Usage = {
   limits: Limit[]
   /** US dollars this session has cost, as /cost totals it; null where the host keeps no ledger */
   cost: number | null
+  /** the main loop's model as /model shows it; null until known */
+  model: string | null
 }
+
+/** What Claude Code was told about the prompt cache and idle compaction (lib cacheConfig). */
+export type CacheConfig = { ttl: '5m' | '1h' | null; idle: boolean; idleMin: number }
 
 /** When the main thread's last API response landed (ms), and whether the cooling warning was shown for it. */
 export type Cache = { lastAt: number | null; warned: boolean }
 
 export type Phase = 'idle' | 'writing' | 'clearing' | 'reading'
-export type Flow = { phase: Phase; path: string | null }
+/** startedAt: when the handoff was asked for (ms); only a file written after it counts as this run's */
+export type Flow = { phase: Phase; path: string | null; startedAt: number | null }
 
 /** What the main thread did with its tools this conversation, the evidence for the kind of work and its strain. */
 export type Activity = {
@@ -36,6 +42,6 @@ export type Activity = {
 declare module 'claude-code' {
   interface PluginState {
     // handoff: the last handoff this work continued from, which the next one builds on
-    'context-band': { usage: Usage | null; flow: Flow; cache: Cache; tick: number; handoff: string | null; activity: Activity }
+    'context-band': { usage: Usage | null; flow: Flow; cache: Cache; tick: number; handoff: string | null; activity: Activity; config: CacheConfig }
   }
 }

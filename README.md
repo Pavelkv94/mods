@@ -4,9 +4,11 @@ Claude Code mods.
 
 | Mod | What it does |
 | --- | --- |
-| [agent-crabs](./agent-crabs) | Side pane with a card per subagent: animated crab, model, progress bar, API-equivalent cost, and expandable details of its operations, files and tokens |
+| [agent-crabs](./agent-crabs) | Side pane with a card per subagent and background process: animated crab, model, context fill, idle warning, API-equivalent cost, and expandable operations, files and tokens |
 | [context-band](./context-band) | Band above the prompt: context fill, rate limits, session cost and a Handoff button that writes a handoff doc, clears the context and reads it back |
-| [next-steps](./next-steps) | После каждого ответа Haiku предлагает над полем ввода три разных варианта следующей команды столбиком с полным текстом; клик или цифра 1–3 отправляет её в чат. |
+| [next-steps](./next-steps) | Только в desktop-приложении: после каждого ответа Haiku предлагает над полем ввода три разных варианта следующей команды столбиком с полным текстом; клик или цифра 1–3 вставляет её в поле ввода, Enter отправляет как твою команду. |
+| [done-sound](./done-sound) | Проигрывает звук Glass, когда Claude завершает задачу ответом (только основной цикл, без сабагентов). |
+| [session-branches](./session-branches) | Terminal-only pane with the tree of this project's sessions and their forks; press a row to switch to it |
 
 ## Install
 

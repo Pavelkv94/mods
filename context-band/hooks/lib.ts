@@ -1,4 +1,4 @@
-import type { Activity } from '../types'
+import type { Activity, CacheConfig } from '../types'
 
 const LIMIT_NAMES: Record<string, string> = {
   five_hour: '5h',
@@ -81,7 +81,7 @@ export function slug(s: string): string {
 export function stamp(ms: number): string {
   const d = new Date(ms)
   const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 
 export function handoffPath(home: string, root: string, now: number): string {
@@ -153,10 +153,55 @@ export const HANDOFF_LABEL = '✦ Handoff'
 
 const MIN = 60_000
 
-/** Prompt-cache TTL: a subscription (rate limits reported) caches for 1 hour, an API key for 5 minutes. */
-export function cacheTtlMs(hasLimits: boolean): number {
-  return hasLimits ? 60 * MIN : 5 * MIN
+// the plan's own windows; a gateway's `spend_limit` is API-key billing, not a subscription
+const PLAN_WINDOW = /^(five_hour|seven_day)/
+
+/**
+ * Prompt-cache TTL of the main conversation, as Claude Code picks it (code.claude.com/docs/en/prompt-caching):
+ * the person's choice first (env, then `promptCacheTtl`); else 1 hour on a subscription within its plan,
+ * 5 minutes once a plan window is used up (overage) and with an API key, a gateway or a cloud provider.
+ */
+export function cacheTtlMs(limits: readonly { kind: string; percentUsed: number }[], pref: CacheConfig['ttl'] = null): number {
+  if (pref) return pref === '1h' ? 60 * MIN : 5 * MIN
+  const plan = limits.filter(l => PLAN_WINDOW.test(l.kind))
+  return plan.length > 0 && plan.every(l => l.percentUsed < 100) ? 60 * MIN : 5 * MIN
 }
+
+export const DEFAULT_CACHE_CONFIG: CacheConfig = { ttl: null, idle: true, idleMin: 200_000 }
+
+const truthy = (v: string | undefined) => v !== undefined && /^(1|true|yes|on)$/i.test(v.trim())
+
+/**
+ * The cache and idle-compaction settings that change what the band should say, in Claude Code's order:
+ * `FORCE_PROMPT_CACHING_5M`, then `CLAUDE_CODE_PROMPT_CACHE_TTL`, then `promptCacheTtl`, then
+ * `ENABLE_PROMPT_CACHING_1H` (settings reference, promptCacheTtl); idle compaction is on unless
+ * `idleCompaction` or `autoCompactEnabled` is false or `DISABLE_AUTO_COMPACT` is set, from 200,000
+ * tokens or `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`, never below 100,000 (settings reference, idleCompaction).
+ */
+export function cacheConfig(env: Record<string, string | undefined>, settings: Record<string, unknown>): CacheConfig {
+  const asTtl = (v: unknown) => (v === '5m' || v === '1h' ? v : null)
+  const ttl = truthy(env.FORCE_PROMPT_CACHING_5M)
+    ? '5m'
+    : asTtl(env.CLAUDE_CODE_PROMPT_CACHE_TTL?.trim()) ?? asTtl(settings.promptCacheTtl) ?? (truthy(env.ENABLE_PROMPT_CACHING_1H) ? '1h' : null)
+  const idle = settings.idleCompaction !== false && settings.autoCompactEnabled !== false && !truthy(env.DISABLE_AUTO_COMPACT)
+  const min = Number.parseInt(env.CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS ?? '', 10)
+  return { ttl, idle, idleMin: Number.isFinite(min) && min > 0 ? Math.max(100_000, min) : 200_000 }
+}
+
+/** Idle compaction runs after about 54 minutes without a request (settings reference, idleCompaction). */
+export const IDLE_COMPACT_MS = 54 * MIN
+
+/**
+ * Milliseconds until Claude Code compacts this conversation while it sits idle, or null where it will not:
+ * an interactive terminal session on the 1-hour cache whose context has reached the threshold.
+ */
+export function idleLeftMs(o: { lastAt: number | null; ttl: number; tokens: number | null; config: CacheConfig; terminal: boolean; now: number }): number | null {
+  if (!o.terminal || !o.config.idle || o.lastAt === null || o.ttl < 60 * MIN || (o.tokens ?? 0) < o.config.idleMin) return null
+  return Math.max(0, o.lastAt + IDLE_COMPACT_MS - o.now)
+}
+
+/** Leeway for comparing a file's mtime with the clock: the two are read at different moments. */
+export const MTIME_SLACK_MS = 2000
 
 /** Milliseconds until the cache entry written by the last response expires; null before any response. */
 export function cacheLeftMs(lastAt: number | null, ttlMs: number, now: number): number | null {
@@ -185,6 +230,21 @@ export function cacheColor(leftMs: number | null, ttlMs: number, isWorking: bool
 }
 
 /** A pie for surfaces that draw SVG: the coloured slice is the share left, clockwise from the top. */
+// an unfilled ring like Claude's own usage gauge: a faint track and an arc of the used share, clockwise from 12 o'clock
+export function ringSvg(percent: number, color: string, size = 14, stroke = 2): string {
+  const p = Math.max(0, Math.min(100, percent))
+  const c = size / 2
+  const r = c - stroke / 2
+  const fill = SVG_HEX[color] ?? color
+  const len = 2 * Math.PI * r
+  const used = ((p / 100) * len).toFixed(2)
+  const track = `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${SVG_HEX.inactive}" stroke-opacity="0.35" stroke-width="${stroke}"/>`
+  const arc = p > 0
+    ? `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${fill}" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${used} ${len.toFixed(2)}" transform="rotate(-90 ${c} ${c})"/>`
+    : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${track}${arc}</svg>`
+}
+
 export function pieSvg(percent: number, color: string, size = 14): string {
   const p = Math.max(0, Math.min(100, percent))
   const c = size / 2
@@ -325,56 +385,172 @@ export function workKind(a: Activity): Work {
 }
 
 /**
- * Where a long context starts to cost quality, by kind of work: code juggles many exact details and
- * versions of files and suffers first; finding facts in read material holds up longest.
+ * Measured long-context curves. Anthropic gives no token count where quality starts to drop, only "a
+ * performance gradient rather than a hard cliff" (anthropic.com/engineering/effective-context-engineering-for-ai-agents),
+ * so the band reads the published per-model measurements instead of fixed thresholds.
+ *
+ * MRCR v2, 8 needles (contextarena.ai, "GDM-MRCRv2 Full", read 2026-10-21): pick the right one of many
+ * near-identical items, the closest public measure of keeping exact details apart, as code work does with
+ * files edited many times. Average score, %, per bin of (b/2, b] tokens, at the highest reasoning effort
+ * measured; the last bin stands in beyond 512k, where no Claude model has a score.
  */
-export const WORK_LIMITS: Record<Work, { soft: number; hard: number; name: string }> = {
-  code: { soft: 120_000, hard: 200_000, name: 'работа с кодом' },
-  research: { soft: 250_000, hard: 400_000, name: 'исследование и чтение' },
-  chat: { soft: 150_000, hard: 250_000, name: 'обсуждение' },
+export const MRCR_BINS = [8_192, 16_384, 32_768, 65_536, 131_072, 262_144, 524_288]
+export const MRCR: Record<string, readonly number[]> = {
+  'opus-5': [98.7, 99.9, 99.3, 99.9, 91.3, 65.6, 42.5],
+  'sonnet-5': [96.4, 94.9, 87.9, 68.0, 52.9, 52.2, 32.0],
+  'opus-4.8': [97.4, 96.1, 93.0, 90.7, 75.2, 61.8, 39.8],
+  'opus-4.6': [98.2, 84.4, 86.2, 74.3, 68.1, 69.1, 54.3],
+  'sonnet-4.6': [96.7, 82.0, 85.2, 79.4, 72.4, 69.3, 45.9],
+  'haiku-4.5': [82.5, 47.5, 31.5, 17.0, 13.8],
 }
 
-const HANDOFF_HINT = 'Рекомендую Handoff: умный clear с handoff-документом'
+/**
+ * GraphWalks Parents, F1 (Claude Opus 4.8 system card, table 8.9.A): following links through a long
+ * input, the measure of reading comprehension; the 256k and 1M subsets.
+ */
+export const GRAPHWALKS: Record<string, { k256: number; m1: number }> = {
+  'opus-4.8': { k256: 99.3, m1: 83.3 },
+  'opus-4.7': { k256: 93.6, m1: 56.6 },
+  'opus-4.6': { k256: 95.4, m1: 48.6 },
+}
 
-function workDetail(a: Activity, kind: Work): string {
-  if (kind === 'code') return `${a.edits} правок, ${a.runs} запусков`
-  if (kind === 'research') return `${a.reads + a.web} чтений`
-  return ''
+/** Drops below the model's own short-context score, in points, that make a tip: info, warn, hot. */
+export const DROP = { info: 10, warn: 20, hot: 30 } as const
+
+/** Where comprehension was measured to hold: GraphWalks' 256k subset. */
+export const COMPREHENSION_TOKENS = 262_144
+
+export type ModelId = { family: string; major: number; minor: number }
+
+/** `claude-opus-4-6`, `Opus 5.5 (1M context)`, `claude-sonnet-5-20260301` → family and version; null otherwise. */
+export function parseModel(name: string | null | undefined): ModelId | null {
+  const m = /(opus|sonnet|haiku|fable|mythos)[\s_-]*(\d+)(?:[.-](\d)(?!\d))?/i.exec(name ?? '')
+  return m ? { family: m[1]!.toLowerCase(), major: Number(m[2]), minor: Number(m[3] ?? 0) } : null
+}
+
+export type Curves = {
+  mrcr: { key: string; scores: readonly number[] } | null
+  graph: { key: string; k256: number; m1: number } | null
+}
+
+/**
+ * The curves for a model: its own where published, else its nearest measured predecessor in the same line,
+ * a conservative stand-in (newer models have scored higher). Opus 4.7's MRCR run near zero from 64k looks
+ * like a harness failure next to its own GraphWalks scores, so it reads Opus 4.6's. Haiku 5.x has no
+ * predecessor close enough (Haiku 4.5 is two generations back), so it reads none.
+ */
+export function curvesFor(model: string | null | undefined): Curves {
+  const id = parseModel(model)
+  if (!id) return { mrcr: null, graph: null }
+  const v = id.major + id.minor / 10
+  const own = `${id.family}-${id.minor ? `${id.major}.${id.minor}` : id.major}`
+  let mrcr: string | null = own in MRCR ? own : null
+  let graph: string | null = own in GRAPHWALKS ? own : null
+  if (id.family === 'opus' || id.family === 'fable' || id.family === 'mythos') {
+    mrcr ??= v >= 5 || id.family !== 'opus' ? 'opus-5' : v >= 4.7 ? (v >= 4.8 ? 'opus-4.8' : 'opus-4.6') : null
+    graph ??= v >= 4.8 || id.family !== 'opus' ? 'opus-4.8' : null
+  } else if (id.family === 'sonnet') {
+    mrcr ??= v >= 5 ? 'sonnet-5' : null
+  }
+  return {
+    mrcr: mrcr ? { key: mrcr, scores: MRCR[mrcr]! } : null,
+    graph: graph ? { key: graph, ...GRAPHWALKS[graph]! } : null,
+  }
+}
+
+const binName = (b: number) => `${b / 1024}k`
+
+/** The MRCR score at this many tokens against the model's own score at 8k. */
+export function mrcrAt(scores: readonly number[], tokens: number): { score: number; base: number; drop: number; bin: string } {
+  let i = MRCR_BINS.findIndex(b => tokens <= b)
+  if (i < 0 || i >= scores.length) i = scores.length - 1
+  const base = scores[0]!
+  const score = scores[i]!
+  const bin = i === 0 ? `≤${binName(MRCR_BINS[0]!)}` : `${binName(MRCR_BINS[i - 1]!)}–${binName(MRCR_BINS[i]!)}`
+  return { score, base, drop: Math.round((base - score) * 10) / 10, bin }
+}
+
+function dropTone(drop: number): Advice['tone'] | null {
+  return drop >= DROP.hot ? 'hot' : drop >= DROP.warn ? 'warn' : drop >= DROP.info ? 'info' : null
+}
+
+/**
+ * The tip names the work, how strongly the context degrades, what the measurement for that work tested and
+ * what to do; the scores stay in this file. MRCR tests telling near-identical items apart, GraphWalks
+ * following links across a long input, so each effect says only that.
+ */
+const WORK_NAME: Record<Work, string> = { code: 'Сессия с кодом', research: 'Исследование', chat: 'Обсуждение' }
+const MRCR_EFFECT: Record<Work, string> = {
+  code: 'модель чаще путает похожие фрагменты и версии правок',
+  research: 'модель может путать похожие источники',
+  chat: 'модель может путать похожие фрагменты',
+}
+const GRAPH_EFFECT = 'модель хуже связывает факты из разных частей контекста'
+const DEGREE: Record<Advice['tone'], string> = { info: 'начинает деградировать', warn: 'заметно деградирует', hot: 'сильно деградирует' }
+const STEP: Record<Advice['tone'], string> = {
+  info: 'Сделайте Handoff на границе задачи',
+  warn: 'Сделайте Handoff после текущего шага',
+  hot: 'Сделайте Handoff сейчас',
 }
 
 function symptoms(a: Activity): string[] {
   const out: string[] = []
   if (a.hotFile && a.rereads >= 3) out.push(`${a.hotFile.path.split('/').at(-1)} прочитан ${a.hotFile.count} раз`)
-  if (a.repeatFails >= 2) out.push(`одни и те же команды падают повторно (${a.repeatFails})`)
+  // Anthropic: "After two failed corrections, /clear and write a better initial prompt" (code.claude.com/docs/en/best-practices)
+  if (a.repeatFails >= 2) out.push('команды падают повторно')
   return out
 }
 
-/** The degradation tip for this context size and work, or null while the context is still fresh. */
-export function degradation(tokens: number, a: Activity): Advice | null {
+const higher = (x: Advice['tone'] | null, y: Advice['tone'] | null) => (toneRank(x) >= toneRank(y) ? x : y)
+
+/**
+ * The degradation tip for this context, work and model, or null while the measurements show no drop.
+ *
+ * Code reads MRCR: precise edits among many similar versions break first (LongCodeBench: repair fell from
+ * 32k while code QA held). Research and discussion read GraphWalks: comprehension held to 256k on every
+ * measured Opus and fell past it; below that they warn only when MRCR already shows a 20-point drop,
+ * which matters when comparing many similar sources. Symptoms count at any size, raised by the curve.
+ */
+export function degradation(tokens: number, a: Activity, model: string | null = null): Advice | null {
   const kind = workKind(a)
-  const lim = WORK_LIMITS[kind]
-  const what = `${shortTokens(tokens)} контекста, ${lim.name}${kind === 'chat' ? '' : ` (${workDetail(a, kind)})`}`
+  const c = curvesFor(model)
+  const at = c.mrcr ? mrcrAt(c.mrcr.scores, tokens) : null
+
+  let tone: Advice['tone'] | null = null
+  let effect = MRCR_EFFECT[kind]
+  if (kind === 'code') tone = at ? dropTone(at.drop) : null
+  else if (c.graph && tokens > COMPREHENSION_TOKENS) {
+    tone = 'warn'
+    effect = GRAPH_EFFECT
+  } else if (at && at.drop >= DROP.warn) tone = 'info'
+
   const signs = symptoms(a)
-  // re-reading and retrying in a small context is ordinary work, not strain
-  if (signs.length > 0 && tokens >= lim.soft / 2) {
-    return { tone: tokens >= lim.soft ? 'hot' : 'warn', kind: 'degrade', text: `Признаки деградации контекста: ${signs.join('; ')}. ${what}. ${HANDOFF_HINT}.` }
+  if (signs.length > 0) {
+    const raised = higher(at && at.drop >= DROP.warn ? 'hot' : at && at.drop >= DROP.info ? 'warn' : 'info', tone)!
+    const about = `${WORK_NAME[kind]}, признаки деградации: ${signs.join('; ')}`
+    return { tone: raised, kind: 'degrade', about, text: `${about}. ${STEP[raised]}.` }
   }
-  if (tokens >= lim.hard) {
-    return { tone: 'warn', kind: 'degrade', text: `${what}: модель начинает терять ранние детали и решения. ${HANDOFF_HINT} после текущего шага.` }
-  }
-  if (tokens >= lim.soft) {
-    return { tone: 'info', kind: 'degrade', text: `${what}: на ближайшей границе задачи сделайте Handoff, пока качество не просело.` }
-  }
-  return null
+  if (!tone) return null
+  const about = `${WORK_NAME[kind]}, контекст ${DEGREE[tone]} (~${shortTokens(tokens)}): ${effect}`
+  return { tone, kind: 'degrade', about, text: `${about}. ${STEP[tone]}.` }
 }
 
 export function toneRank(t: Advice['tone'] | null): number {
   return t === 'hot' ? 3 : t === 'warn' ? 2 : t === 'info' ? 1 : 0
 }
 
-export type Advice = { tone: 'info' | 'warn' | 'hot'; kind?: 'degrade'; text: string }
+/** `about`: the degradation without the step, for a tip that joins it with another reason */
+export type Advice = { tone: 'info' | 'warn' | 'hot'; kind?: 'degrade'; about?: string; text: string }
 
-export type AdviceInput = BandData & { cacheLeft: number | null; ttl: number; now: number; activity?: Activity }
+export type AdviceInput = BandData & {
+  cacheLeft: number | null
+  ttl: number
+  now: number
+  activity?: Activity
+  model?: string | null
+  /** ms until idle compaction, null where it will not run (idleLeftMs) */
+  idleLeft?: number | null
+}
 
 /** The single most useful tip for the current context, cache and limits; null when nothing needs doing. */
 export function advise(a: AdviceInput): Advice | null {
@@ -383,7 +559,13 @@ export function advise(a: AdviceInput): Advice | null {
   const big = tokens >= BIG_CONTEXT
   const ctx = a.tokens === null ? 'весь контекст' : `~${shortTokens(a.tokens)} контекста`
   const warm = a.cacheLeft !== null && a.cacheLeft > 0
+  const idle = a.idleLeft ?? null
 
+  // idle compaction comes 6 minutes before the 1-hour cache cools, so it is the deadline that matters
+  if (idle !== null && idle > 0 && idle <= cacheWarnMs(a.ttl)) {
+    const min = Math.ceil(idle / MIN)
+    return { tone: 'hot', text: `Через ${min} мин простоя Claude Code сам сожмёт ${ctx} (idle compaction). Нужны детали — Handoff сейчас; вернётесь скоро — отправьте любое сообщение.` }
+  }
   if (warm && a.cacheLeft! <= cacheWarnMs(a.ttl)) {
     const min = Math.ceil(a.cacheLeft! / MIN)
     return big
@@ -393,9 +575,14 @@ export function advise(a: AdviceInput): Advice | null {
   if (pct >= 85) {
     return { tone: 'hot', text: `Контекст ${pct}%: сделайте Handoff на ближайшей паузе, иначе автокомпакт сожмёт без handoff.` }
   }
-  const strain = degradation(tokens, a.activity ?? NO_ACTIVITY)
+  const strain = degradation(tokens, a.activity ?? NO_ACTIVITY, a.model ?? null)
+  const cold = a.cacheLeft !== null && a.cacheLeft <= 0 && big
+  // both call for a Handoff, and a cold cache makes the next message re-write the whole degraded context
+  if (strain?.about && strain.tone !== 'info' && cold) {
+    return { tone: strain.tone, kind: 'degrade', text: `Кэш остыл. ${strain.about}. Сделайте Handoff до следующего сообщения — оно заново запишет ${ctx}.` }
+  }
   if (strain && strain.tone !== 'info') return strain
-  if (a.cacheLeft !== null && a.cacheLeft <= 0 && big) {
+  if (cold) {
     return { tone: 'warn', text: `Кэш остыл: следующее сообщение заново запишет ${ctx}. Продолжаете ту же задачу — сначала Handoff; новая задача — новая сессия.` }
   }
   const lim = a.limits.filter(l => l.percentUsed >= 85).sort((x, y) => y.percentUsed - x.percentUsed)[0]
@@ -406,11 +593,7 @@ export function advise(a: AdviceInput): Advice | null {
       text: `Лимит ${limitName(lim.kind)} ${Math.round(lim.percentUsed)}%${reset ? `, сброс через ${reset}` : ''}: поиски отдавайте субагентам, уточнения шлите одним сообщением.`,
     }
   }
-  if (strain) return strain
-  if (pct >= 60 && warm) {
-    return { tone: 'info', text: `Контекст ${pct}%: на ближайшей границе задачи сделайте Handoff, пока кэш тёплый.` }
-  }
-  return null
+  return strain
 }
 
 export function adviceColor(tone: Advice['tone']): string {
